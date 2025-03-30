@@ -1,0 +1,78 @@
+/**
+ * @file cbs.api
+ * @brief VPP control-plane API messages for the CBS plugin
+ */
+
+// Version should reflect changes from nsim base
+option version = "1.0.0"; // Start versioning for CBS plugin
+import "vnet/interface_types.api";
+
+/** @brief Enable/disable the CBS cross-connect between two interfaces
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param enable_disable - enable or disable the feature
+    @param sw_if_index0 - one interface to cross-connect
+    @param sw_if_index1 - the other interface to cross-connect
+*/
+// Renamed API message
+autoreply define cbs_cross_connect_enable_disable
+{
+  u32 client_index;
+  u32 context;
+  bool enable_disable;
+  vl_api_interface_index_t sw_if_index0;
+  vl_api_interface_index_t sw_if_index1;
+  option vat_help = "[<intfc0> | sw_if_index <swif0>] [<intfc1> | sw_if_index <swif1>] [disable]";
+};
+
+/** @brief Enable/disable the CBS output feature on an interface
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param enable_disable - enable or disable the feature
+    @param sw_if_index - interface
+*/
+// Renamed API message
+autoreply define cbs_output_feature_enable_disable
+{
+  u32 client_index;
+  u32 context;
+  bool enable_disable;
+  vl_api_interface_index_t sw_if_index;
+  option vat_help = "[<intfc> | sw_if_index <nnn>] [disable]";
+};
+
+
+/** @brief Configure the CBS parameters
+    @param client_index - opaque cookie to identify the sender
+    @param context - sender context, to match reply w/ request
+    @param average_packet_size - average packet size hint for wheel sizing (bytes)
+    @param bandwidth_in_bits_per_second - bps hint for wheel sizing
+    @param packets_per_drop - simulate 1 drop per N packets (0=disable)
+    @param packets_per_reorder - simulate 1 reorder per N packets (0=disable)
+    @param port_rate_bps - Port transmission rate in bits per second
+    @param idleslope_kbps - CBS idleslope in kilobits per second
+    @param hicredit_bytes - CBS hicredit in bytes
+    @param locredit_bytes - CBS locredit in bytes (signed)
+*/
+// Renamed API message (was nsim_configure_cbs)
+autoreply define cbs_configure
+{
+  u32 client_index;
+  u32 context;
+
+  /* Sizing/Optional parameters */
+  u32 average_packet_size;
+  u64 bandwidth_in_bits_per_second;
+  u32 packets_per_drop;
+  u32 packets_per_reorder;
+
+  /* CBS Parameters */
+  u64 port_rate_bps;
+  u64 idleslope_kbps;
+  i32 hicredit_bytes;
+  i32 locredit_bytes;
+
+  option vat_help = "port_rate <bps> idleslope <kbps> hicredit <bytes> locredit <bytes> [bandwidth <bps>] [packet-size <bytes>] [packets-per-drop <n>] [packets-per-reorder <n>]";
+};
+
+// Remove deprecated nsim_configure and nsim_configure2 APIs if they are not needed

@@ -1,0 +1,9 @@
+---
+name: Credit Based Shaper (CBS)
+maintainer: Your Name <your.email@example.com> # Placeholder
+features:
+  - Network shaping using Credit Based Shaper (CBS) algorithm
+  - Optional packet loss and reordering simulation
+description: "Implements the IEEE 802.1Q-2014 Credit Based Shaper (CBS)"
+state: development
+properties: [CLI, MULTITHREAD]
