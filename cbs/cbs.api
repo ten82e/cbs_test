@@ -3,7 +3,7 @@
  * @brief VPP control-plane API messages for the CBS plugin
  */
 
-option version = "1.4.0"; // Increment version for feature removal
+option version = "1.4.0"; // Version reflects removal of loss/reorder params from nsim base
 import "vnet/interface_types.api";
 
 /** @brief Enable/disable the CBS cross-connect between two interfaces */
@@ -33,8 +33,6 @@ autoreply define cbs_output_feature_enable_disable
     @param context - sender context, to match reply w/ request
     @param average_packet_size - average packet size hint for wheel sizing (bytes, 0=default 1500)
     @param bandwidth_in_bits_per_second - bps hint for wheel sizing (0=use port_rate)
-    // packets_per_drop removed
-    // packets_per_reorder removed
     @param port_rate_bps - Port transmission rate in bits per second (mandatory)
     @param idleslope_kbps - CBS idleslope in kilobits per second (mandatory)
     @param hicredit_bytes - CBS hicredit in bytes (mandatory)
@@ -46,17 +44,14 @@ autoreply define cbs_configure
   u32 context;
 
   /* Sizing/Optional parameters */
-  u32 average_packet_size;
-  u64 bandwidth_in_bits_per_second;
-  // u32 packets_per_drop;           // Removed
-  // u32 packets_per_reorder;        // Removed
+  u32 average_packet_size; /* Network Byte Order */
+  u64 bandwidth_in_bits_per_second; /* Network Byte Order */
 
   /* CBS Parameters (Mandatory) */
-  u64 port_rate_bps;
-  u64 idleslope_kbps;
-  i32 hicredit_bytes;
-  i32 locredit_bytes;
+  u64 port_rate_bps; /* Network Byte Order */
+  u64 idleslope_kbps; /* Network Byte Order */
+  i32 hicredit_bytes; /* Network Byte Order */
+  i32 locredit_bytes; /* Network Byte Order */
 
-  // Removed packets-per-drop and packets-per-reorder from help
   option vat_help = "port_rate <bps> idleslope <kbps> hicredit <bytes> locredit <bytes> [bandwidth <bps>] [packet-size <bytes>]";
 };
