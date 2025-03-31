@@ -20,6 +20,7 @@
 #include <vnet/api_errno.h> // For VNET_API_ERROR_* constants
 #include <vppinfra/cpu.h>
 #include <vlib/node_funcs.h>
+#include <vppinfra/error.h> // Included for potential clib_error usage (though removed now)
 
 #include <cbs/cbs.api_enum.h>
 #include <cbs/cbs.api_types.h>
@@ -82,36 +83,41 @@ cbs_cross_connect_enable_disable (cbs_main_t * cbsm, u32 sw_if_index0,
 
   hw0 = vnet_get_hw_interface (vnm, sw_if_index0);
   hw1 = vnet_get_hw_interface (vnm, sw_if_index1);
+  // Safety check for hw pointers
+  if (PREDICT_FALSE(!hw0 || !hw1)) {
+      // clib_warning is okay here, or return error
+      clib_warning("CBS XCONN Enable: Failed to get hw interface struct for sw_if %u or %u", sw_if_index0, sw_if_index1);
+      return VNET_API_ERROR_INVALID_INTERFACE;
+  }
+
 
   if (enable_disable) {
-      // Add arcs from cbs-wheel node to the hardware output nodes
       cbsm->output_next_index0 = vlib_node_add_next (vm, cbs_input_node.index, hw0->output_node_index);
       cbsm->output_next_index1 = vlib_node_add_next (vm, cbs_input_node.index, hw1->output_node_index);
-      #if VLIB_DEBUG > 0 // Added debug log
+
+      #if VLIB_DEBUG > 0 // Original debug log
       clib_warning("CBS Xconn Enable: Added next for sw_if %u -> %u (input node %u, hw node %u)",
                    sw_if_index0, cbsm->output_next_index0, cbs_input_node.index, hw0->output_node_index);
       clib_warning("CBS Xconn Enable: Added next for sw_if %u -> %u (input node %u, hw node %u)",
                    sw_if_index1, cbsm->output_next_index1, cbs_input_node.index, hw1->output_node_index);
       #endif
-      // Check if adding the next node failed
+
+      // Original check for failure (add_next returns ~0 on failure)
       if (PREDICT_FALSE(cbsm->output_next_index0 == ~0 || cbsm->output_next_index1 == ~0)) {
+          // Using clib_error here is acceptable as it indicates a setup failure
           clib_error("CBS Xconn Enable: FAILED to add next node arcs!");
           // Potentially clean up partially added arcs and return error
-          // For simplicity now, just log the error. A more robust implementation
-          // might attempt cleanup or return a specific error code.
-          // return VNET_API_ERROR_INVALID_NODE; // Example error
+          // For simplicity now, just log the error.
+          // return VNET_API_ERROR_UNSPECIFIED; // Example error
       }
   } else {
-      // Clear stored next node indices when disabling
       cbsm->output_next_index0 = ~0;
       cbsm->output_next_index1 = ~0;
   }
 
-  // Store sw_if_indices if enabling, clear if disabling
   cbsm->sw_if_index0 = enable_disable ? sw_if_index0 : ~0;
   cbsm->sw_if_index1 = enable_disable ? sw_if_index1 : ~0;
 
-  // Enable/disable the cbs-cross-connect feature on the device-input arc
   rv = vnet_feature_enable_disable ("device-input", "cbs-cross-connect",
 			                           sw_if_index0, enable_disable, 0, 0);
   if (rv != 0) return rv;
@@ -119,7 +125,6 @@ cbs_cross_connect_enable_disable (cbs_main_t * cbsm, u32 sw_if_index0,
   rv = vnet_feature_enable_disable ("device-input", "cbs-cross-connect",
 			                           sw_if_index1, enable_disable, 0, 0);
   if (rv != 0) {
-     // Rollback the first enable if the second failed
      vnet_feature_enable_disable("device-input", "cbs-cross-connect", sw_if_index0, 0, 0, 0);
      return rv;
    }
@@ -146,30 +151,36 @@ cbs_output_feature_enable_disable (cbs_main_t * cbsm, u32 sw_if_index,
   if (sw->type != VNET_SW_INTERFACE_TYPE_HARDWARE) return VNET_API_ERROR_INVALID_INTERFACE;
 
   hw = vnet_get_hw_interface (vnm, sw_if_index);
+  // Safety check for hw pointer
+  if (PREDICT_FALSE(!hw)) {
+      // clib_warning is okay here, or return error
+      clib_warning("CBS Output Enable: Failed to get hw interface for sw_if %u", sw_if_index);
+      return VNET_API_ERROR_INVALID_INTERFACE;
+  }
 
   if (enable_disable) {
-      // Ensure the vector is large enough and initialize if needed
+      // Original code before adding explicit logging
       vec_validate_init_empty (cbsm->output_next_index_by_sw_if_index, sw_if_index, ~0);
-      // Add arc from cbs-wheel node to the hardware output node
       u32 added_next = vlib_node_add_next (vm, cbs_input_node.index, hw->output_node_index);
       cbsm->output_next_index_by_sw_if_index[sw_if_index] = added_next;
-      #if VLIB_DEBUG > 0 // Added debug log
+
+      #if VLIB_DEBUG > 0 // Original debug log
       clib_warning("CBS Output Enable: Added next for sw_if %u -> %u (input node %u, hw node %u)",
                    sw_if_index, added_next, cbs_input_node.index, hw->output_node_index);
       #endif
-      // Check if adding the next node failed
+
+      // Original check for failure (add_next returns ~0 on failure)
       if (PREDICT_FALSE(added_next == ~0)) {
+          // Using clib_error here is acceptable as it indicates a setup failure
           clib_error("CBS Output Enable: FAILED to add next node arc for sw_if %u!", sw_if_index);
-          // return VNET_API_ERROR_INVALID_NODE; // Example error
+          // return VNET_API_ERROR_UNSPECIFIED; // Example error
       }
   } else {
-      // Clear the stored next index if disabling
       if (sw_if_index < vec_len(cbsm->output_next_index_by_sw_if_index)) {
           cbsm->output_next_index_by_sw_if_index[sw_if_index] = ~0;
       }
   }
 
-  // Enable/disable the cbs-output-feature on the interface-output arc
   rv = vnet_feature_enable_disable ("interface-output", "cbs-output-feature",
 			                           sw_if_index, enable_disable, 0, 0);
 
@@ -200,7 +211,6 @@ cbs_wheel_alloc (cbs_main_t *cbsm, u32 thread_index)
 
   wp->cbs_credits = 0.0;
 
-  // CORRECTED: Use the VM of the thread calling alloc (main thread during config)
   f64 main_thread_now = vlib_time_now(cbsm->vlib_main);
   wp->cbs_last_update_time = main_thread_now;
   wp->cbs_last_tx_finish_time = main_thread_now;
@@ -316,7 +326,6 @@ cbs_configure_internal (cbs_main_t * cbsm, f64 port_rate_bps,
              }
          }
          vec_reset_length(cbsm->wheel_by_thread);
-         // Use VNET_API_ERROR_UNSPECIFIED for allocation failure
          return VNET_API_ERROR_UNSPECIFIED;
       }
   }
@@ -513,6 +522,7 @@ format_cbs_config (u8 * s, va_list * args)
    s = format (s, "CBS Configuration:\n");
    s = format (s, "  Port Rate:       %U\n", format_cbs_rate, cbsm->cbs_port_rate);
    s = format (s, "  Idle Slope:      %U\n", format_cbs_slope, cbsm->cbs_idleslope);
+   // Use format_cbs_rate for sendslope, which is bytes/sec converted to rate
    s = format (s, "  Send Slope:      %U/sec (calculated)\n", format_cbs_rate, cbsm->cbs_sendslope);
    s = format (s, "  HiCredit:        %.0f bytes\n", cbsm->cbs_hicredit);
    s = format (s, "  LoCredit:        %.0f bytes\n", cbsm->cbs_locredit);
