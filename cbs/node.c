@@ -35,7 +35,7 @@ typedef enum
 } cbs_error_t;
 
 /* --- Next Node Definitions --- */
-// <<< Original state >>>
+// Only drop path is defined for enqueue nodes
 typedef enum
 {
   CBS_NEXT_DROP,
@@ -47,8 +47,9 @@ typedef struct
 {
   u32 buffer_index;
   u32 rx_sw_if_index;
-  u32 tx_sw_if_index;
+  u32 tx_sw_if_index; // TX sw_if_index *before* potential modification in lookup
   cbs_trace_action_t trace_action;
+  u32 calculated_next_index; // Next index *after* the wheel node
 } cbs_trace_t;
 
 
@@ -57,15 +58,17 @@ typedef struct
 /** @brief Add trace record for CBS enqueue node. */
 static void
 cbs_add_trace (vlib_main_t * vm, vlib_node_runtime_t * node,
-               vlib_buffer_t * b, cbs_trace_action_t trace_action)
+               vlib_buffer_t * b, cbs_trace_action_t trace_action,
+               u32 calculated_next_index)
 {
    if (PREDICT_FALSE((node->flags & VLIB_NODE_FLAG_TRACE) && (b->flags & VLIB_BUFFER_IS_TRACED)))
      {
        cbs_trace_t *t = vlib_add_trace (vm, node, b, sizeof (*t));
        t->buffer_index = vlib_get_buffer_index(vm, b);
        t->rx_sw_if_index = vnet_buffer(b)->sw_if_index[VLIB_RX];
-       t->tx_sw_if_index = vnet_buffer(b)->sw_if_index[VLIB_TX];
+       t->tx_sw_if_index = vnet_buffer(b)->sw_if_index[VLIB_TX]; // Record original TX
        t->trace_action = trace_action;
+       t->calculated_next_index = calculated_next_index;
      }
 }
 
@@ -74,66 +77,93 @@ always_inline void
 cbs_buffer_fwd_lookup (cbs_main_t * cbsm, vlib_buffer_t * b,
                        u32 * next, u8 is_cross_connect)
 {
-  u32 tx_sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_TX];
+  vlib_main_t * vm = vlib_get_main(); // Get vlib_main for logging node names
+  u32 tx_sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_TX]; // Original TX before potential change
   u32 rx_sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_RX];
-  u32 bi = vlib_get_buffer_index(vlib_get_main(), b);
-  // Use standard C cast to void to suppress unused variable warning when VLIB_DEBUG is 0
-  (void)bi;
+  u32 bi = vlib_get_buffer_index(vm, b);
+  (void)bi; // Suppress unused warning if VLIB_DEBUG=0
 
   if (is_cross_connect) {
       u32 peer_sw_if_index = (rx_sw_if_index == cbsm->sw_if_index0) ? cbsm->sw_if_index1 : cbsm->sw_if_index0;
-      vnet_buffer (b)->sw_if_index[VLIB_TX] = peer_sw_if_index;
 
-      if (PREDICT_FALSE(peer_sw_if_index == ~0 || rx_sw_if_index == ~0 ||
+      // Validate before assigning to buffer's TX index
+      if (PREDICT_FALSE(peer_sw_if_index == (u32)~0 || rx_sw_if_index == (u32)~0 ||
                         (rx_sw_if_index != cbsm->sw_if_index0 && rx_sw_if_index != cbsm->sw_if_index1))) {
           #if VLIB_DEBUG > 0
-          clib_warning("CBS FWD Lookup FAIL (XConn): bi %u, invalid rx %u / peer %u (cfg: %u, %u)",
+          clib_warning("CBS FWD Lookup FAIL (XConn Invalid If): bi %u, invalid rx %u / peer %u (cfg: %u, %u)",
                        bi, rx_sw_if_index, peer_sw_if_index, cbsm->sw_if_index0, cbsm->sw_if_index1);
           #endif
-          *next = CBS_NEXT_DROP; // Use enum value for drop
+          *next = CBS_NEXT_DROP;
           return;
       }
+      // Modify buffer's TX sw_if_index for the peer
+      vnet_buffer (b)->sw_if_index[VLIB_TX] = peer_sw_if_index;
+
+      // Lookup the next node based on the *peer* interface
       *next = (peer_sw_if_index == cbsm->sw_if_index0) ? cbsm->output_next_index0 : cbsm->output_next_index1;
 
-      if (PREDICT_FALSE(*next == CBS_NEXT_DROP || *next == ~0)) {
+      if (PREDICT_FALSE(*next == CBS_NEXT_DROP || *next == (u32)~0)) { // Cast ~0
          #if VLIB_DEBUG > 0
-          clib_warning("CBS FWD Lookup FAIL (XConn Invalid Next): bi %u, rx %u, peer %u -> next %u (cfg next0: %u, next1: %u)",
-                       bi, rx_sw_if_index, peer_sw_if_index, *next, cbsm->output_next_index0, cbsm->output_next_index1);
+          vlib_node_t *next_node = vlib_get_node_by_next_node_and_edge(vm, cbs_input_node.index, *next);
+          clib_warning("CBS FWD Lookup FAIL (XConn Invalid Next): bi %u, rx %u, peer %u -> next_index %u ('%U') (cfg next0: %u, next1: %u)",
+                       bi, rx_sw_if_index, peer_sw_if_index, *next,
+                       format_vlib_node_name, vm, (next_node ? next_node->index : (u32)~0),
+                       cbsm->output_next_index0, cbsm->output_next_index1);
          #endif
-         *next = CBS_NEXT_DROP; // Ensure it's set to drop
+         *next = CBS_NEXT_DROP; // Ensure drop on failure
       }
 
+
   } else { /* Output feature mode */
-      if (PREDICT_FALSE(tx_sw_if_index == ~0)) {
+      // --- ADD DEBUG LOG START ---
+      #if VLIB_DEBUG > 0
+      u32 vec_len_check = vec_len(cbsm->output_next_index_by_sw_if_index);
+      u32 stored_next_check = (tx_sw_if_index < vec_len_check) ? cbsm->output_next_index_by_sw_if_index[tx_sw_if_index] : (u32)-2; // Read value for logging
+      clib_warning("CBS FWD Lookup DBG: Enter Output Mode: bi %u, tx_sw_if %u, vec_len %u, read stored_next %u",
+                    bi, tx_sw_if_index, vec_len_check, stored_next_check);
+      #endif
+      // --- ADD DEBUG LOG END ---
+
+      // Use the original tx_sw_if_index for lookup
+      if (PREDICT_FALSE(tx_sw_if_index == (u32)~0)) { // Cast ~0
           #if VLIB_DEBUG > 0
-          clib_warning("CBS FWD Lookup FAIL (Output Invalid TX If): bi %u, invalid tx %u", bi, tx_sw_if_index);
+          clib_warning("CBS FWD Lookup FAIL (Output Invalid TX If): bi %u, invalid tx_sw_if_index %u", bi, tx_sw_if_index);
           #endif
-          *next = CBS_NEXT_DROP; // Use enum value for drop
+          *next = CBS_NEXT_DROP;
           return;
       }
 
       u32 vec_len_safe = vec_len(cbsm->output_next_index_by_sw_if_index);
-      if (tx_sw_if_index < vec_len_safe &&
-          cbsm->output_next_index_by_sw_if_index[tx_sw_if_index] != ~0) {
-          *next = cbsm->output_next_index_by_sw_if_index[tx_sw_if_index];
-          #if VLIB_DEBUG > 0
-          // clib_warning("CBS FWD Lookup OK (Output): bi %u, tx %u -> next %u", bi, tx_sw_if_index, *next);
+      u32 potential_next = (u32)~0; // Initialize potential_next
+
+      if (tx_sw_if_index < vec_len_safe) {
+           potential_next = cbsm->output_next_index_by_sw_if_index[tx_sw_if_index];
+      }
+
+      // Check if the retrieved value is valid (~0 means not set or invalid)
+      if (PREDICT_TRUE(potential_next != (u32)~0)) {
+          *next = potential_next;
+          #if VLIB_DEBUG > 1 // Make this log level higher if too verbose
+          vlib_node_t *next_node = vlib_get_node_by_next_node_and_edge(vm, cbs_input_node.index, *next);
+          clib_warning("CBS FWD Lookup OK (Output): bi %u, tx_sw_if %u -> next_index %u ('%U')",
+                       bi, tx_sw_if_index, *next,
+                       format_vlib_node_name, vm, (next_node ? next_node->index : (u32)~0));
           #endif
       } else {
-          #if VLIB_DEBUG > 0
-          clib_warning("CBS FWD Lookup FAIL (Output Not Found/Invalid): bi %u, tx %u not found in vec (len %u, val %d)",
-                       bi, tx_sw_if_index, vec_len_safe,
-                       (tx_sw_if_index < vec_len_safe ? (i32)cbsm->output_next_index_by_sw_if_index[tx_sw_if_index] : -2));
+          #if VLIB_DEBUG > 0 // Modified debug log
+          clib_warning("CBS FWD Lookup FAIL (Output Not Found/Invalid): bi %u, tx_sw_if %u not found or invalid next in vec (len %u, next_val %u)",
+                       bi, tx_sw_if_index, vec_len_safe, potential_next); // Log potential_next which would be ~0
           #endif
-          *next = CBS_NEXT_DROP; // Use enum value for drop
+          *next = CBS_NEXT_DROP;
       }
   }
 
-  if (PREDICT_FALSE(*next == ~0)) {
+  // Final safety check (should be redundant if logic above is correct, but keep for safety)
+  if (PREDICT_FALSE(*next == (u32)~0)) {
        #if VLIB_DEBUG > 0
-       clib_warning("CBS FWD Lookup FAIL (Final Check): bi %u resulted in next ~0", bi);
+       clib_warning("CBS FWD Lookup FAIL (Final Check): bi %u for tx_sw_if %u resulted in next ~0", bi, tx_sw_if_index);
        #endif
-      *next = CBS_NEXT_DROP; // Use enum value for drop
+      *next = CBS_NEXT_DROP;
   }
 }
 
@@ -144,35 +174,40 @@ cbs_dispatch_buffer (vlib_main_t * vm, vlib_node_runtime_t * node,
                      cbs_main_t * cbsm, cbs_wheel_t * wp, vlib_buffer_t * b,
                      u32 bi, cbs_node_ctx_t * ctx, u8 is_cross_connect)
 {
+    // Check wheel full condition first
     if (PREDICT_FALSE(wp->cursize >= wp->wheel_size)) {
         ctx->drop[0] = bi;
         ctx->drop++;
-        cbs_add_trace(vm, node, b, CBS_TRACE_ACTION_DROP_WHEEL_FULL);
+        cbs_add_trace(vm, node, b, CBS_TRACE_ACTION_DROP_WHEEL_FULL, CBS_NEXT_DROP);
         return;
     }
 
+    // Determine the next node index *after* the wheel
     u32 next_idx_after_wheel;
     cbs_buffer_fwd_lookup(cbsm, b, &next_idx_after_wheel, is_cross_connect);
 
+    // If lookup failed, drop the packet
     if (PREDICT_FALSE(next_idx_after_wheel == CBS_NEXT_DROP)) {
          ctx->drop[0] = bi;
          ctx->drop++;
          ctx->n_lookup_drop++;
-         cbs_add_trace(vm, node, b, CBS_TRACE_ACTION_DROP_LOOKUP_FAIL);
+         cbs_add_trace(vm, node, b, CBS_TRACE_ACTION_DROP_LOOKUP_FAIL, CBS_NEXT_DROP);
          return;
     }
 
+    // Add the buffer to the wheel
     cbs_wheel_entry_t *e = &wp->entries[wp->tail];
     e->buffer_index = bi;
-    e->rx_sw_if_index = vnet_buffer(b)->sw_if_index[VLIB_RX];
-    e->tx_sw_if_index = vnet_buffer(b)->sw_if_index[VLIB_TX];
-    e->output_next_index = next_idx_after_wheel;
+    e->rx_sw_if_index = vnet_buffer(b)->sw_if_index[VLIB_RX]; // Store original RX
+    e->tx_sw_if_index = vnet_buffer(b)->sw_if_index[VLIB_TX]; // Store potentially modified TX (for cross-connect)
+    e->output_next_index = next_idx_after_wheel;             // Store the calculated next index
 
     wp->tail = (wp->tail + 1) % wp->wheel_size;
     wp->cursize++;
     ctx->n_buffered++;
 
-    cbs_add_trace(vm, node, b, CBS_TRACE_ACTION_BUFFER);
+    // Add trace for successful buffering
+    cbs_add_trace(vm, node, b, CBS_TRACE_ACTION_BUFFER, next_idx_after_wheel);
 }
 
 
@@ -186,36 +221,60 @@ cbs_inline_fn (vlib_main_t * vm, vlib_node_runtime_t * node, vlib_frame_t * fram
     cbs_wheel_t *wp = NULL;
     u32 n_left_from, *from;
     vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b;
-    u32 drops[VLIB_FRAME_SIZE];
-    cbs_node_ctx_t ctx;
+    u32 drops[VLIB_FRAME_SIZE]; // Array to store indices of buffers to be dropped
+    cbs_node_ctx_t ctx;       // Context for this frame processing
 
     from = vlib_frame_vector_args (frame);
     n_left_from = frame->n_vectors;
     vlib_get_buffers (vm, from, bufs, n_left_from);
     b = bufs;
 
-    // --- Fallback Logic ---
+    // --- Fallback Logic: If CBS not configured or no wheel for this thread ---
+    // Directly enqueue to the next node in the graph without CBS processing.
+    // This relies on the feature arc setup: if this feature node is enabled,
+    // the next node should be the one originally intended after this feature.
     if (PREDICT_FALSE(!cbsm->is_configured || thread_index >= vec_len(cbsm->wheel_by_thread) || !(wp = cbsm->wheel_by_thread[thread_index]))) {
         vlib_node_increment_counter (vm, node->node_index,
                                      cbsm->is_configured ? CBS_ERROR_NO_WHEEL : CBS_ERROR_NOT_CONFIGURED,
                                      frame->n_vectors);
-        vlib_buffer_enqueue_to_next(vm, node, from,
-                                    (u16*) vlib_node_get_runtime_data(vm, node->node_index),
-                                    frame->n_vectors);
-        return frame->n_vectors;
+
+        // Get the next node index configured for this feature node (runtime data)
+        // This assumes the default next node (index 0) is the correct pass-through path.
+        // NOTE: This passthrough logic might need refinement depending on graph setup.
+        // If the feature is *disabled*, this node shouldn't run. If enabled but *misconfigured*,
+        // forwarding to the default next node (usually error-drop) might be safer than guessing.
+        // For now, assuming the runtime data holds the passthrough next index.
+        // A safer alternative is to force drop here if misconfigured.
+        u16 *next_indices = vlib_node_get_runtime_data (vm, node->node_index); // This gets the next_nodes array
+        if (PREDICT_FALSE(!next_indices)) {
+            // Catastrophic failure, drop everything
+             vlib_buffer_free (vm, from, frame->n_vectors);
+             vlib_node_increment_counter(vm, node->node_index, CBS_ERROR_DROPPED_LOOKUP_FAIL, frame->n_vectors);
+             return frame->n_vectors;
+        }
+         // Enqueue to the *first* next node defined for this graph node (often index 0)
+         // This might not be the desired passthrough behavior in all cases.
+        vlib_buffer_enqueue_to_next(vm, node, from, next_indices, frame->n_vectors);
+
+        return frame->n_vectors; // All packets forwarded (or dropped if next_indices[0] is drop)
     }
 
-    // --- Normal Processing Logic ---
-    ctx.drop = drops;
-    ctx.n_buffered = 0;
+    // --- Normal Processing Logic: Buffer packets to the CBS wheel ---
+    ctx.drop = drops;          // Point to the start of the drop array
+    ctx.n_buffered = 0;      // Reset counters for this frame
     ctx.n_lookup_drop = 0;
 
-    // <<< Logging removed >>>
-
-    // Process packets... (loops remain the same)
+    // --- Process Packets in Batches ---
+    // Loop unrolling for efficiency (common VPP pattern)
     while (n_left_from >= 8) {
-       clib_prefetch_load (&b[4]->pre_data); clib_prefetch_load (&b[5]->pre_data);
-       clib_prefetch_load (&b[6]->pre_data); clib_prefetch_load (&b[7]->pre_data);
+       // Prefetch buffer headers for the next iteration
+       vlib_prefetch_buffer_header(b[4], STORE); vlib_prefetch_buffer_header(b[5], STORE);
+       vlib_prefetch_buffer_header(b[6], STORE); vlib_prefetch_buffer_header(b[7], STORE);
+       // Prefetch buffer data (optional, might help depending on access patterns)
+       // clib_prefetch_load (&b[4]->pre_data); clib_prefetch_load (&b[5]->pre_data);
+       // clib_prefetch_load (&b[6]->pre_data); clib_prefetch_load (&b[7]->pre_data);
+
+        // Process 8 packets
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[0], from[0], &ctx, is_cross_connect);
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[1], from[1], &ctx, is_cross_connect);
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[2], from[2], &ctx, is_cross_connect);
@@ -224,46 +283,69 @@ cbs_inline_fn (vlib_main_t * vm, vlib_node_runtime_t * node, vlib_frame_t * fram
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[5], from[5], &ctx, is_cross_connect);
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[6], from[6], &ctx, is_cross_connect);
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[7], from[7], &ctx, is_cross_connect);
+
         b += 8; from += 8; n_left_from -= 8;
     }
-    while (n_left_from >= 4) {
-       clib_prefetch_load (&b[0]->pre_data); clib_prefetch_load (&b[1]->pre_data);
-       clib_prefetch_load (&b[2]->pre_data); clib_prefetch_load (&b[3]->pre_data);
+     while (n_left_from >= 4) {
+        // Prefetch headers
+        vlib_prefetch_buffer_header(b[0], STORE); vlib_prefetch_buffer_header(b[1], STORE);
+        vlib_prefetch_buffer_header(b[2], STORE); vlib_prefetch_buffer_header(b[3], STORE);
+        // Prefetch data
+        // clib_prefetch_load (&b[0]->pre_data); clib_prefetch_load (&b[1]->pre_data);
+        // clib_prefetch_load (&b[2]->pre_data); clib_prefetch_load (&b[3]->pre_data);
+
+        // Process 4 packets
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[0], from[0], &ctx, is_cross_connect);
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[1], from[1], &ctx, is_cross_connect);
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[2], from[2], &ctx, is_cross_connect);
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[3], from[3], &ctx, is_cross_connect);
+
         b += 4; from += 4; n_left_from -= 4;
     }
+    // Process remaining packets individually
     while (n_left_from > 0) {
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[0], from[0], &ctx, is_cross_connect);
         b += 1; from += 1; n_left_from -= 1;
     }
 
-    // Handle drops
-    u32 n_dropped_total = ctx.drop - drops;
+    // --- Handle Dropped Packets ---
+    u32 n_dropped_total = ctx.drop - drops; // Calculate total drops in this frame
     if (PREDICT_FALSE(n_dropped_total > 0)) {
-        vlib_buffer_free (vm, drops, n_dropped_total);
-        vlib_node_increment_counter (vm, node->node_index, CBS_ERROR_DROPPED_WHEEL_FULL, n_dropped_total - ctx.n_lookup_drop);
+        vlib_buffer_free (vm, drops, n_dropped_total); // Free the dropped buffers
+
+        // Increment drop counters
+        u32 n_wheel_full_drops = n_dropped_total - ctx.n_lookup_drop;
+        if (n_wheel_full_drops > 0) {
+             vlib_node_increment_counter (vm, node->node_index, CBS_ERROR_DROPPED_WHEEL_FULL, n_wheel_full_drops);
+        }
         if (ctx.n_lookup_drop > 0) {
              vlib_node_increment_counter (vm, node->node_index, CBS_ERROR_DROPPED_LOOKUP_FAIL, ctx.n_lookup_drop);
         }
+         #if VLIB_DEBUG > 0
+         if (n_dropped_total > 0) {
+             clib_warning("CBS Enqueue node %s: Dropped %u packets (WheelFull: %u, LookupFail: %u)",
+                          node->name, n_dropped_total, n_wheel_full_drops, ctx.n_lookup_drop);
+         }
+         #endif
     }
 
+   // Increment buffered packet counter
    if (ctx.n_buffered > 0) {
       vlib_node_increment_counter (vm, node->node_index, CBS_ERROR_BUFFERED, ctx.n_buffered);
    }
 
-   return frame->n_vectors;
+   return frame->n_vectors; // Return total number of packets processed in the input frame
 }
 
 
 /* --- Node Function Definitions --- */
+// Wrapper function for cross-connect mode
 VLIB_NODE_FN (cbs_cross_connect_node) (vlib_main_t * vm, vlib_node_runtime_t * node, vlib_frame_t * frame)
 {
     return cbs_inline_fn (vm, node, frame, 1 /* is_cross_connect = true */);
 }
 
+// Wrapper function for output feature mode
 VLIB_NODE_FN (cbs_output_feature_node) (vlib_main_t * vm, vlib_node_runtime_t * node, vlib_frame_t * frame)
 {
     return cbs_inline_fn (vm, node, frame, 0 /* is_cross_connect = false */);
@@ -299,13 +381,15 @@ format_cbs_trace (u8 * s, va_list * args)
       default: break;
   }
 
-  s = format (s, "CBS_ENQ (bi %u): %s rx_sw %d tx_sw %d",
-              t->buffer_index, action_str, t->rx_sw_if_index, t->tx_sw_if_index);
+  // Include the calculated next index in the trace
+  s = format (s, "CBS_ENQ (bi %u): %s rx_sw %u tx_sw %u next_idx %u",
+              t->buffer_index, action_str, t->rx_sw_if_index, t->tx_sw_if_index,
+              t->calculated_next_index);
   return s;
 }
 
 // --- Node Registrations ---
-// <<< Reverted node registration changes >>>
+// Define node registration variables (used by VLIB_REGISTER_NODE)
 vlib_node_registration_t cbs_cross_connect_node;
 vlib_node_registration_t cbs_output_feature_node;
 
@@ -314,13 +398,14 @@ VLIB_REGISTER_NODE (cbs_cross_connect_node) =
   .name = "cbs-cross-connect",
   .vector_size = sizeof (u32),
   .format_trace = format_cbs_trace,
-  .type = VLIB_NODE_TYPE_INTERNAL,
+  .type = VLIB_NODE_TYPE_INTERNAL, // Internal node, processes packets between other nodes
   .n_errors = ARRAY_LEN(cbs_error_strings),
   .error_strings = cbs_error_strings,
-  .n_next_nodes = CBS_N_NEXT, // Should be 1
+  .n_next_nodes = CBS_N_NEXT, // Only has a drop node as next
   .next_nodes = {
-    [CBS_NEXT_DROP] = "error-drop",
+    [CBS_NEXT_DROP] = "error-drop", // Default drop node
   },
+  // Add .process_function if needed for runtime node state changes
 };
 
 VLIB_REGISTER_NODE (cbs_output_feature_node) =
@@ -328,15 +413,14 @@ VLIB_REGISTER_NODE (cbs_output_feature_node) =
   .name = "cbs-output-feature",
   .vector_size = sizeof (u32),
   .format_trace = format_cbs_trace,
-  .type = VLIB_NODE_TYPE_INTERNAL,
+  .type = VLIB_NODE_TYPE_INTERNAL, // Internal node
   .n_errors = ARRAY_LEN(cbs_error_strings),
   .error_strings = cbs_error_strings,
-  .n_next_nodes = CBS_N_NEXT, // Should be 1
+  .n_next_nodes = CBS_N_NEXT, // Only has a drop node as next
   .next_nodes = {
-    [CBS_NEXT_DROP] = "error-drop",
+    [CBS_NEXT_DROP] = "error-drop", // Default drop node
   },
 };
-// <<< Reverted END >>>
 
 #endif // CLIB_MARCH_VARIANT
 

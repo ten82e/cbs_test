@@ -20,7 +20,7 @@
 #include <vnet/api_errno.h> // For VNET_API_ERROR_* constants
 #include <vppinfra/cpu.h>
 #include <vlib/node_funcs.h>
-#include <vppinfra/error.h> // Included for potential clib_error usage (though removed now)
+#include <vppinfra/error.h>
 
 #include <cbs/cbs.api_enum.h>
 #include <cbs/cbs.api_types.h>
@@ -68,6 +68,7 @@ cbs_cross_connect_enable_disable (cbs_main_t * cbsm, u32 sw_if_index0,
   vlib_main_t * vm = cbsm->vlib_main;
   vnet_main_t *vnm = cbsm->vnet_main;
   int rv = 0;
+  u32 added_next0 = (u32)~0, added_next1 = (u32)~0; // Track added indices
 
   if (PREDICT_FALSE(cbsm->is_configured == 0 && enable_disable))
     return VNET_API_ERROR_FEATURE_DISABLED;
@@ -78,41 +79,55 @@ cbs_cross_connect_enable_disable (cbs_main_t * cbsm, u32 sw_if_index0,
   sw0 = vnet_get_sw_interface (vnm, sw_if_index0);
   sw1 = vnet_get_sw_interface (vnm, sw_if_index1);
 
+  // Only support hardware interfaces for cross-connect for simplicity now
   if (sw0->type != VNET_SW_INTERFACE_TYPE_HARDWARE) return VNET_API_ERROR_INVALID_INTERFACE;
   if (sw1->type != VNET_SW_INTERFACE_TYPE_HARDWARE) return VNET_API_ERROR_INVALID_INTERFACE;
+
 
   hw0 = vnet_get_hw_interface (vnm, sw_if_index0);
   hw1 = vnet_get_hw_interface (vnm, sw_if_index1);
   // Safety check for hw pointers
   if (PREDICT_FALSE(!hw0 || !hw1)) {
-      // clib_warning is okay here, or return error
       clib_warning("CBS XCONN Enable: Failed to get hw interface struct for sw_if %u or %u", sw_if_index0, sw_if_index1);
       return VNET_API_ERROR_INVALID_INTERFACE;
   }
 
 
   if (enable_disable) {
-      cbsm->output_next_index0 = vlib_node_add_next (vm, cbs_input_node.index, hw0->output_node_index);
-      cbsm->output_next_index1 = vlib_node_add_next (vm, cbs_input_node.index, hw1->output_node_index);
+      u32 target_node_index0 = hw0->output_node_index;
+      u32 target_node_index1 = hw1->output_node_index;
+      added_next0 = vlib_node_add_next (vm, cbs_input_node.index, target_node_index0);
+      added_next1 = vlib_node_add_next (vm, cbs_input_node.index, target_node_index1);
+      cbsm->output_next_index0 = added_next0; // Store result
+      cbsm->output_next_index1 = added_next1; // Store result
 
-      #if VLIB_DEBUG > 0 // Original debug log
-      clib_warning("CBS Xconn Enable: Added next for sw_if %u -> %u (input node %u, hw node %u)",
-                   sw_if_index0, cbsm->output_next_index0, cbs_input_node.index, hw0->output_node_index);
-      clib_warning("CBS Xconn Enable: Added next for sw_if %u -> %u (input node %u, hw node %u)",
-                   sw_if_index1, cbsm->output_next_index1, cbs_input_node.index, hw1->output_node_index);
+      #if VLIB_DEBUG > 0 // Enhanced debug log
+      clib_warning("CBS Xconn Enable: Trying to add next for sw_if %u: '%U' (%u) -> '%U' (%u), result_next_index %u",
+                   sw_if_index0,
+                   format_vlib_node_name, vm, cbs_input_node.index, cbs_input_node.index,
+                   format_vlib_node_name, vm, target_node_index0, target_node_index0,
+                   added_next0);
+       clib_warning("CBS Xconn Enable: Trying to add next for sw_if %u: '%U' (%u) -> '%U' (%u), result_next_index %u",
+                   sw_if_index1,
+                   format_vlib_node_name, vm, cbs_input_node.index, cbs_input_node.index,
+                   format_vlib_node_name, vm, target_node_index1, target_node_index1,
+                   added_next1);
       #endif
 
-      // Original check for failure (add_next returns ~0 on failure)
-      if (PREDICT_FALSE(cbsm->output_next_index0 == ~0 || cbsm->output_next_index1 == ~0)) {
-          // Using clib_error here is acceptable as it indicates a setup failure
+      // Check for failure explicitly and return error
+      if (PREDICT_FALSE(added_next0 == (u32)~0 || added_next1 == (u32)~0)) {
           clib_error("CBS Xconn Enable: FAILED to add next node arcs!");
-          // Potentially clean up partially added arcs and return error
-          // For simplicity now, just log the error.
-          // return VNET_API_ERROR_UNSPECIFIED; // Example error
+          cbsm->output_next_index0 = ~0; // Ensure set to invalid on failure
+          cbsm->output_next_index1 = ~0;
+          // No easy rollback for vlib_node_add_next
+          return VNET_API_ERROR_UNSPECIFIED; // Use standard unspecified error
       }
   } else {
       cbsm->output_next_index0 = ~0;
       cbsm->output_next_index1 = ~0;
+      #if VLIB_DEBUG > 0
+      clib_warning("CBS Xconn Disable: Cleared next indices");
+      #endif
   }
 
   cbsm->sw_if_index0 = enable_disable ? sw_if_index0 : ~0;
@@ -120,12 +135,29 @@ cbs_cross_connect_enable_disable (cbs_main_t * cbsm, u32 sw_if_index0,
 
   rv = vnet_feature_enable_disable ("device-input", "cbs-cross-connect",
 			                           sw_if_index0, enable_disable, 0, 0);
-  if (rv != 0) return rv;
+  if (rv != 0) {
+      // Rollback setting indices if feature enable failed
+      if(enable_disable) {
+        cbsm->output_next_index0 = ~0;
+        cbsm->output_next_index1 = ~0;
+        cbsm->sw_if_index0 = ~0;
+        cbsm->sw_if_index1 = ~0;
+      }
+      return rv;
+  }
+
 
   rv = vnet_feature_enable_disable ("device-input", "cbs-cross-connect",
 			                           sw_if_index1, enable_disable, 0, 0);
   if (rv != 0) {
+     // Rollback first interface if second failed
      vnet_feature_enable_disable("device-input", "cbs-cross-connect", sw_if_index0, 0, 0, 0);
+     if(enable_disable) {
+        cbsm->output_next_index0 = ~0;
+        cbsm->output_next_index1 = ~0;
+        cbsm->sw_if_index0 = ~0;
+        cbsm->sw_if_index1 = ~0;
+     }
      return rv;
    }
 
@@ -141,6 +173,7 @@ cbs_output_feature_enable_disable (cbs_main_t * cbsm, u32 sw_if_index,
   vlib_main_t * vm = cbsm->vlib_main;
   vnet_main_t *vnm = cbsm->vnet_main;
   int rv = 0;
+  u32 added_next = (u32)~0; // Initialize added_next
 
   if (PREDICT_FALSE(cbsm->is_configured == 0 && enable_disable))
     return VNET_API_ERROR_FEATURE_DISABLED;
@@ -148,41 +181,73 @@ cbs_output_feature_enable_disable (cbs_main_t * cbsm, u32 sw_if_index,
   if (!vnet_sw_if_index_is_api_valid(sw_if_index)) return VNET_API_ERROR_INVALID_SW_IF_INDEX;
 
   sw = vnet_get_sw_interface (vnm, sw_if_index);
-  if (sw->type != VNET_SW_INTERFACE_TYPE_HARDWARE) return VNET_API_ERROR_INVALID_INTERFACE;
+  /* Handle VNET_SW_INTERFACE_TYPE_P2P etc which may not have hw_if */
+  /* Allow sub-interfaces as well */
+  if (sw->type != VNET_SW_INTERFACE_TYPE_HARDWARE &&
+      sw->type != VNET_SW_INTERFACE_TYPE_SUB)
+      return VNET_API_ERROR_INVALID_INTERFACE;
 
-  hw = vnet_get_hw_interface (vnm, sw_if_index);
+
+  // Use vnet_get_sup_hw_interface to correctly handle sub-interfaces finding their parent hw interface
+  hw = vnet_get_sup_hw_interface (vnm, sw_if_index);
   // Safety check for hw pointer
   if (PREDICT_FALSE(!hw)) {
-      // clib_warning is okay here, or return error
-      clib_warning("CBS Output Enable: Failed to get hw interface for sw_if %u", sw_if_index);
+      clib_warning("CBS Output Enable: Failed to get hardware interface for sw_if %u", sw_if_index);
       return VNET_API_ERROR_INVALID_INTERFACE;
   }
 
   if (enable_disable) {
-      // Original code before adding explicit logging
       vec_validate_init_empty (cbsm->output_next_index_by_sw_if_index, sw_if_index, ~0);
-      u32 added_next = vlib_node_add_next (vm, cbs_input_node.index, hw->output_node_index);
-      cbsm->output_next_index_by_sw_if_index[sw_if_index] = added_next;
+      u32 target_node_index = hw->output_node_index;
+      added_next = vlib_node_add_next (vm, cbs_input_node.index, target_node_index);
+      cbsm->output_next_index_by_sw_if_index[sw_if_index] = added_next; // Store result
 
-      #if VLIB_DEBUG > 0 // Original debug log
-      clib_warning("CBS Output Enable: Added next for sw_if %u -> %u (input node %u, hw node %u)",
-                   sw_if_index, added_next, cbs_input_node.index, hw->output_node_index);
+      // --- ADD DEBUG LOG START ---
+      #if VLIB_DEBUG > 0
+      clib_warning("CBS Output Enable DBG: Stored next_index %u for sw_if %u in output_next_index_by_sw_if_index",
+                   added_next, sw_if_index);
+      #endif
+      // --- ADD DEBUG LOG END ---
+
+      #if VLIB_DEBUG > 0 // Enhanced debug log
+      clib_warning("CBS Output Enable: Trying to add next for sw_if %u: '%U' (%u) -> '%U' (%u), result_next_index %u",
+                   sw_if_index,
+                   format_vlib_node_name, vm, cbs_input_node.index, cbs_input_node.index,
+                   format_vlib_node_name, vm, target_node_index, target_node_index,
+                   added_next);
       #endif
 
-      // Original check for failure (add_next returns ~0 on failure)
-      if (PREDICT_FALSE(added_next == ~0)) {
-          // Using clib_error here is acceptable as it indicates a setup failure
-          clib_error("CBS Output Enable: FAILED to add next node arc for sw_if %u!", sw_if_index);
-          // return VNET_API_ERROR_UNSPECIFIED; // Example error
+      // Check for failure explicitly and return error
+      if (PREDICT_FALSE(added_next == (u32)~0)) {
+          clib_error("CBS Output Enable: FAILED to add next node arc from '%U' (%u) to '%U' (%u) for sw_if %u!",
+                     format_vlib_node_name, vm, cbs_input_node.index, cbs_input_node.index,
+                     format_vlib_node_name, vm, target_node_index, target_node_index,
+                     sw_if_index);
+          cbsm->output_next_index_by_sw_if_index[sw_if_index] = ~0; // Ensure it's ~0 on failure
+          return VNET_API_ERROR_UNSPECIFIED; // Return standard unspecified error
       }
   } else {
+      // Disable: Set index to ~0. Feature disable hook handles graph changes.
       if (sw_if_index < vec_len(cbsm->output_next_index_by_sw_if_index)) {
           cbsm->output_next_index_by_sw_if_index[sw_if_index] = ~0;
+          #if VLIB_DEBUG > 0
+          clib_warning("CBS Output Disable: Set next index to ~0 for sw_if %u", sw_if_index);
+          #endif
       }
   }
 
+  // Enable/Disable the feature on the interface-output arc
   rv = vnet_feature_enable_disable ("interface-output", "cbs-output-feature",
 			                           sw_if_index, enable_disable, 0, 0);
+
+  // Rollback if feature enable failed after adding the arc
+  if (rv != 0 && enable_disable && added_next != (u32)~0) {
+       clib_warning("CBS Output Enable: vnet_feature_enable_disable failed (rv=%d) after adding next arc for sw_if %u. Rolling back next index.", rv, sw_if_index);
+       cbsm->output_next_index_by_sw_if_index[sw_if_index] = ~0;
+       // vlib_node_del_next might be needed for a full rollback, but it's complex.
+       // Simply setting index to ~0 prevents lookup success.
+       // Return the original error from feature_enable_disable
+  }
 
   return rv;
 }
@@ -209,11 +274,16 @@ cbs_wheel_alloc (cbs_main_t *cbsm, u32 thread_index)
   wp->tail = 0;
   wp->entries = (cbs_wheel_entry_t *) (wp + 1);
 
-  wp->cbs_credits = 0.0;
+  wp->cbs_credits = 0.0; // Initialize credits
 
-  f64 main_thread_now = vlib_time_now(cbsm->vlib_main);
-  wp->cbs_last_update_time = main_thread_now;
-  wp->cbs_last_tx_finish_time = main_thread_now;
+  // --- REVERTED ---
+  // Always use the main thread's time context when called from configure
+  // This is because this function is called from the main thread during configuration.
+  f64 now = vlib_time_now(cbsm->vlib_main);
+  // --- REVERTED END ---
+
+  wp->cbs_last_update_time = now;
+  wp->cbs_last_tx_finish_time = now;
 
   return wp;
 }
@@ -248,7 +318,7 @@ cbs_configure_internal (cbs_main_t * cbsm, f64 port_rate_bps,
 
   // --- Validate Parameters ---
   if (PREDICT_FALSE(port_rate_bps <= 0.0)) return VNET_API_ERROR_INVALID_VALUE;
-  if (PREDICT_FALSE(idleslope_kbps <= 0.0)) return VNET_API_ERROR_INVALID_VALUE_2;
+  if (PREDICT_FALSE(idleslope_kbps < 0.0)) return VNET_API_ERROR_INVALID_VALUE_2; // Allow 0 idleslope? Standard says > 0.
   if (PREDICT_FALSE(hicredit_bytes < locredit_bytes)) return VNET_API_ERROR_INVALID_VALUE_3;
 
   if (packet_size == 0) packet_size = CBS_DEFAULT_PACKET_SIZE;
@@ -264,11 +334,13 @@ cbs_configure_internal (cbs_main_t * cbsm, f64 port_rate_bps,
       vlib_worker_thread_barrier_sync (vm);
       for (i = 0; i < vec_len (cbsm->wheel_by_thread); i++) {
           vlib_main_t *wrk_vm = vlib_get_main_by_index(i);
-          if (wrk_vm && cbs_input_node.index != ~0) {
+          if (wrk_vm && cbs_input_node.index != (u32)~0) { // Check node index validity
               vlib_node_set_state (wrk_vm, cbs_input_node.index, VLIB_NODE_STATE_DISABLED);
               #if VLIB_DEBUG > 0
               clib_warning("CBS Configure: Disabled polling for cbs-wheel on thread %d", i);
               #endif
+          } else if (wrk_vm && cbs_input_node.index == (u32)~0) {
+              clib_warning("CBS Configure: cbs_input_node index invalid, cannot disable polling on thread %d", i);
           }
           if (cbsm->wheel_by_thread[i]) {
             cbs_wheel_free(cbsm, cbsm->wheel_by_thread[i]);
@@ -278,7 +350,7 @@ cbs_configure_internal (cbs_main_t * cbsm, f64 port_rate_bps,
       vec_reset_length(cbsm->wheel_by_thread);
       vlib_worker_thread_barrier_release (vm);
       clib_warning("CBS Configure: Previous wheels freed and polling disabled.");
-      cbsm->is_configured = 0;
+      cbsm->is_configured = 0; // Mark as not configured until fully set up again
   }
 
   // --- Store new configuration ---
@@ -293,17 +365,20 @@ cbs_configure_internal (cbs_main_t * cbsm, f64 port_rate_bps,
   cbsm->configured_bandwidth = effective_bandwidth_for_sizing / CBS_BITS_PER_BYTE;
 
   // --- Calculate Wheel Size ---
-  f64 buffer_time_target = 0.010;
+  // Using a fixed buffer time target might be simpler than complex bandwidth calculations
+  f64 buffer_time_target = 0.010; // Target 10ms buffering
   u64 total_buffer_bytes = (cbsm->cbs_port_rate * buffer_time_target);
-  total_buffer_bytes = clib_max(total_buffer_bytes, (u64)cbsm->packet_size * 1024);
+  // Ensure a minimum size based on packets
+  total_buffer_bytes = clib_max(total_buffer_bytes, (u64)cbsm->packet_size * 1024); // At least 1024 packets worth
 
   u32 num_workers = vlib_num_workers();
   u64 per_worker_buffer_bytes = (num_workers > 0) ? (total_buffer_bytes / num_workers) : total_buffer_bytes;
-  per_worker_buffer_bytes = clib_max(per_worker_buffer_bytes, (u64)cbsm->packet_size * 256);
+  // Ensure minimum size per worker
+  per_worker_buffer_bytes = clib_max(per_worker_buffer_bytes, (u64)cbsm->packet_size * 256); // At least 256 packets worth
 
   wheel_slots_per_wrk = per_worker_buffer_bytes / cbsm->packet_size;
-  wheel_slots_per_wrk = clib_max(wheel_slots_per_wrk, (u64)CBS_MIN_WHEEL_SLOTS);
-  wheel_slots_per_wrk++;
+  wheel_slots_per_wrk = clib_max(wheel_slots_per_wrk, (u64)CBS_MIN_WHEEL_SLOTS); // Ensure absolute minimum slots
+  wheel_slots_per_wrk++; // Add one for safety/rounding
   cbsm->wheel_slots_per_wrk = wheel_slots_per_wrk;
 
   #if VLIB_DEBUG > 0
@@ -319,6 +394,7 @@ cbs_configure_internal (cbs_main_t * cbsm, f64 port_rate_bps,
       cbsm->wheel_by_thread[i] = cbs_wheel_alloc (cbsm, i);
       if (PREDICT_FALSE(!cbsm->wheel_by_thread[i])) {
          clib_error("CBS Configure: ERROR - Wheel allocation failed for thread %d", i);
+         // Cleanup previously allocated wheels
          for (int j = 0; j < i; j++) {
              if (cbsm->wheel_by_thread[j]) {
                 cbs_wheel_free(cbsm, cbsm->wheel_by_thread[j]);
@@ -326,7 +402,7 @@ cbs_configure_internal (cbs_main_t * cbsm, f64 port_rate_bps,
              }
          }
          vec_reset_length(cbsm->wheel_by_thread);
-         return VNET_API_ERROR_UNSPECIFIED;
+         return VNET_API_ERROR_UNSPECIFIED; // Use standard unspecified error
       }
   }
   #if VLIB_DEBUG > 0
@@ -334,22 +410,23 @@ cbs_configure_internal (cbs_main_t * cbsm, f64 port_rate_bps,
   #endif
 
   // --- Finalize and Enable Polling ---
-  cbsm->is_configured = 1;
+  cbsm->is_configured = 1; // Mark as configured *after* successful setup
   #if VLIB_DEBUG > 0
-  clib_warning("CBS Configure: Configuration complete.");
+  clib_warning("CBS Configure: Configuration complete. Enabling polling.");
   #endif
 
   vlib_worker_thread_barrier_sync (vm);
   for (i = 0; i < n_threads; i++) {
       vlib_main_t *wrk_vm = vlib_get_main_by_index(i);
       if (wrk_vm) {
-          if (PREDICT_TRUE(cbs_input_node.index != ~0)) {
+          if (PREDICT_TRUE(cbs_input_node.index != (u32)~0)) { // Check node index validity
              vlib_node_set_state (wrk_vm, cbs_input_node.index, VLIB_NODE_STATE_POLLING);
              #if VLIB_DEBUG > 0
              clib_warning("CBS Configure: Enabling polling for cbs-wheel on thread %u", i);
              #endif
           } else {
              clib_error("CBS Configure: ERROR - cbs_input_node index invalid, cannot enable polling on thread %u", i);
+             // This indicates a potential VPP startup or plugin registration issue
           }
         }
     }
@@ -372,6 +449,7 @@ static void vl_api_cbs_cross_connect_enable_disable_t_handler
   u32 sw_if_index0 = clib_net_to_host_u32(mp->sw_if_index0);
   u32 sw_if_index1 = clib_net_to_host_u32(mp->sw_if_index1);
 
+  // Basic validation first
   if (!vnet_sw_if_index_is_api_valid (sw_if_index0)) { rv = VNET_API_ERROR_INVALID_SW_IF_INDEX; goto reply; }
   if (!vnet_sw_if_index_is_api_valid (sw_if_index1)) { rv = VNET_API_ERROR_INVALID_SW_IF_INDEX_2; goto reply; }
 
@@ -387,11 +465,15 @@ static void vl_api_cbs_output_feature_enable_disable_t_handler
   vl_api_cbs_output_feature_enable_disable_reply_t *rmp;
   cbs_main_t *cbsm = &cbs_main;
   int rv;
+  u32 sw_if_index = clib_net_to_host_u32(mp->sw_if_index); // Convert once
 
-  VALIDATE_SW_IF_INDEX(mp);
+  // Use VALIDATE_SW_IF_INDEX macro for standard interface validation
+  VALIDATE_SW_IF_INDEX(mp); // Sets rv and jumps to BAD_SW_IF_INDEX_LABEL on error
 
-  rv = cbs_output_feature_enable_disable (cbsm, clib_net_to_host_u32(mp->sw_if_index), (int) (mp->enable_disable));
+  // If validation passed, call the internal function
+  rv = cbs_output_feature_enable_disable (cbsm, sw_if_index, (int) (mp->enable_disable));
 
+// Macro jumps here on validation failure
 BAD_SW_IF_INDEX_LABEL;
   REPLY_MACRO (VL_API_CBS_OUTPUT_FEATURE_ENABLE_DISABLE_REPLY);
 }
@@ -408,6 +490,7 @@ vl_api_cbs_configure_t_handler (vl_api_cbs_configure_t * mp)
 
   port_rate_bps = (f64) clib_net_to_host_u64 (mp->port_rate_bps);
   idleslope_kbps = (f64) clib_net_to_host_u64 (mp->idleslope_kbps);
+  // Convert signed i32 carefully from network u32
   hicredit_bytes = (f64) ((i32) clib_net_to_host_u32(mp->hicredit_bytes));
   locredit_bytes = (f64) ((i32) clib_net_to_host_u32(mp->locredit_bytes));
   packet_size = clib_net_to_host_u32 (mp->average_packet_size);
@@ -431,21 +514,33 @@ cbs_init (vlib_main_t * vm)
   cbsm->vlib_main = vm;
   cbsm->vnet_main = vnet_get_main ();
 
+  // Initialize main struct fields to safe defaults
   cbsm->sw_if_index0 = ~0;
   cbsm->sw_if_index1 = ~0;
   cbsm->output_next_index0 = ~0;
   cbsm->output_next_index1 = ~0;
   cbsm->is_configured = 0;
-  cbsm->output_next_index_by_sw_if_index = 0;
-  cbsm->wheel_by_thread = 0;
+  cbsm->output_next_index_by_sw_if_index = 0; // Initialize vector pointer to NULL
+  cbsm->wheel_by_thread = 0;                  // Initialize vector pointer to NULL
+  cbsm->msg_id_base = 0;                      // Initialize msg_id_base
+  cbsm->arc_index = (u16)~0;                  // Initialize arc_index
+
 
   cbsm->msg_id_base = setup_message_id_table ();
+  if (cbsm->msg_id_base == (u16)~0) { // Check for failure from setup
+      error = clib_error_return (0, "Failed to setup API message ID table");
+      goto done;
+  }
 
+
+  // Get arc index for interface-output
   cbsm->arc_index = vnet_get_feature_arc_index ("interface-output");
   if (cbsm->arc_index == (u16)~0) {
         error = clib_error_return (0, "Failed to get feature arc index for 'interface-output'");
         goto done;
   }
+
+  // Other initializations if needed
 
 done:
   return error;
@@ -458,12 +553,13 @@ VNET_FEATURE_INIT (cbs_cross_connect_feat, static) =
 {
   .arc_name = "device-input",
   .node_name = "cbs-cross-connect",
-  .runs_before = VNET_FEATURES ("ethernet-input"),
+  .runs_before = VNET_FEATURES ("ethernet-input"), // Run before L3 processing
 };
 
 VNET_FEATURE_INIT (cbs_output_feature_feat, static) = {
   .arc_name = "interface-output",
   .node_name = "cbs-output-feature",
+  // Run late in the output arc, but before the final interface transmit node
   .runs_before = VNET_FEATURES ("interface-output-arc-end"),
 };
 
@@ -472,6 +568,7 @@ VLIB_PLUGIN_REGISTER () =
 {
   .version = VPP_BUILD_VER,
   .description = "Credit Based Shaper (CBS) Plugin",
+  // Add other fields like .default_disabled=1 if desired
 };
 
 /* --- CLI Formatters/Unformatters --- */
@@ -489,6 +586,7 @@ static uword
 unformat_cbs_slope (unformat_input_t * input, va_list * args)
 {
   f64 *result = va_arg (*args, f64 *); f64 tmp;
+  // Only accept kbps for idleslope for clarity as per standard
   if (unformat (input, "%f kbps", &tmp) || unformat (input, "%f kbit", &tmp)) *result = tmp;
   else return 0; return 1;
 }
@@ -517,12 +615,16 @@ static u8 *
 format_cbs_config (u8 * s, va_list * args)
 {
    cbs_main_t *cbsm = &cbs_main;
-   int verbose __attribute__((unused)) = va_arg (*args, int);
+   int verbose __attribute__((unused)) = va_arg (*args, int); // Keep verbose argument for potential future use
 
    s = format (s, "CBS Configuration:\n");
+   if (!cbsm->is_configured) {
+        s = format(s, "  Not configured.\n");
+        return s;
+   }
    s = format (s, "  Port Rate:       %U\n", format_cbs_rate, cbsm->cbs_port_rate);
    s = format (s, "  Idle Slope:      %U\n", format_cbs_slope, cbsm->cbs_idleslope);
-   // Use format_cbs_rate for sendslope, which is bytes/sec converted to rate
+   // Use format_cbs_rate for sendslope, as it's also a rate in bytes/sec
    s = format (s, "  Send Slope:      %U/sec (calculated)\n", format_cbs_rate, cbsm->cbs_sendslope);
    s = format (s, "  HiCredit:        %.0f bytes\n", cbsm->cbs_hicredit);
    s = format (s, "  LoCredit:        %.0f bytes\n", cbsm->cbs_locredit);
@@ -533,19 +635,29 @@ format_cbs_config (u8 * s, va_list * args)
    s = format (s, "  Wheel Size:      %u slots/worker\n", cbsm->wheel_slots_per_wrk);
 
    s = format (s, "\nEnabled Interfaces:\n");
-    if (cbsm->sw_if_index0 != ~0) {
-         s = format (s, "  Cross-connect: %U <--> %U\n", format_vnet_sw_if_index_name, cbsm->vnet_main, cbsm->sw_if_index0, format_vnet_sw_if_index_name, cbsm->vnet_main, cbsm->sw_if_index1);
+    if (cbsm->sw_if_index0 != (u32)~0) { // Check explicitly against ~0
+         s = format (s, "  Cross-connect: %U <--> %U\n",
+                     format_vnet_sw_if_index_name, cbsm->vnet_main, cbsm->sw_if_index0,
+                     format_vnet_sw_if_index_name, cbsm->vnet_main, cbsm->sw_if_index1);
     } else {
         int output_feature_enabled = 0;
         u32 i;
-        for (i = 0; i < vec_len (cbsm->output_next_index_by_sw_if_index); i++) {
-          if (cbsm->output_next_index_by_sw_if_index[i] != ~0) {
-            if (!output_feature_enabled) {
-              s = format (s, "  Output Feature on:\n");
-              output_feature_enabled = 1;
+        // Use pool_foreach for potentially sparse vectors if they become pools later
+        // For vec, simple loop is fine. Check length before iterating.
+        if (cbsm->output_next_index_by_sw_if_index) {
+            for (i = 0; i < vec_len (cbsm->output_next_index_by_sw_if_index); i++) {
+              // Check if the index i is valid AND if the next index is set
+              if (cbsm->output_next_index_by_sw_if_index[i] != (u32)~0) {
+                // Double check if the sw_if_index is still valid in VPP
+                 if (!pool_is_free_index(cbsm->vnet_main->interface_main.sw_interfaces, i)) {
+                     if (!output_feature_enabled) {
+                       s = format (s, "  Output Feature on:\n");
+                       output_feature_enabled = 1;
+                     }
+                     s = format (s, "    %U\n", format_vnet_sw_if_index_name, cbsm->vnet_main, i);
+                 }
+              }
             }
-            s = format (s, "    %U\n", format_vnet_sw_if_index_name, cbsm->vnet_main, i);
-          }
         }
         if (!output_feature_enabled) {
             s = format(s, "  None\n");
@@ -570,7 +682,10 @@ cbs_cross_connect_enable_disable_command_fn (vlib_main_t * vm,
    int rv;
    clib_error_t * error = 0;
 
-   if (!unformat_user (input, unformat_line_input, line_input)) return 0;
+   /* Get a line of input. */
+   if (!unformat_user (input, unformat_line_input, line_input))
+     return 0;
+
 
    while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT) {
        if (unformat (line_input, "disable")) enable_disable = 0;
@@ -592,13 +707,16 @@ cbs_cross_connect_enable_disable_command_fn (vlib_main_t * vm,
    rv = cbs_cross_connect_enable_disable (cbsm, sw_if_index0, sw_if_index1, enable_disable);
 
    switch (rv) {
-     case 0: break;
+     case 0: break; // Success
      case VNET_API_ERROR_FEATURE_DISABLED: error = clib_error_return (0, "CBS not configured, please 'set cbs ...' first"); break;
      case VNET_API_ERROR_INVALID_SW_IF_INDEX:
      case VNET_API_ERROR_INVALID_SW_IF_INDEX_2: error = clib_error_return(0, "Invalid software interface index"); break;
-     case VNET_API_ERROR_INVALID_INTERFACE: error = clib_error_return (0, "Invalid interface (must be hardware)"); break;
+     case VNET_API_ERROR_INVALID_INTERFACE: error = clib_error_return (0, "Invalid interface type (must be hardware)"); break;
+     case VNET_API_ERROR_UNSPECIFIED: // Handle the generic error code
+          error = clib_error_return (0, "CBS cross-connect setup failed (unspecified internal error)");
+          break;
      default:
-         error = clib_error_return (0, "cbs_cross_connect_enable_disable failed: %d", rv);
+         error = clib_error_return (0, "cbs_cross_connect_enable_disable failed: rv %d", rv);
          break;
    }
 
@@ -619,7 +737,9 @@ cbs_output_feature_enable_disable_command_fn (vlib_main_t * vm,
     int rv;
     clib_error_t * error = 0;
 
-    if (!unformat_user (input, unformat_line_input, line_input)) return 0;
+    /* Get a line of input. */
+    if (!unformat_user (input, unformat_line_input, line_input))
+        return 0;
 
     while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT) {
         if (unformat (line_input, "disable")) enable_disable = 0;
@@ -633,12 +753,15 @@ cbs_output_feature_enable_disable_command_fn (vlib_main_t * vm,
     rv = cbs_output_feature_enable_disable (cbsm, sw_if_index, enable_disable);
 
     switch (rv) {
-      case 0: break;
+      case 0: break; // Success
       case VNET_API_ERROR_FEATURE_DISABLED: error = clib_error_return (0, "CBS not configured, please 'set cbs ...' first"); break;
       case VNET_API_ERROR_INVALID_SW_IF_INDEX: error = clib_error_return(0, "Invalid software interface index"); break;
-      case VNET_API_ERROR_INVALID_INTERFACE: error = clib_error_return(0, "Invalid interface (must be hardware)"); break;
+      case VNET_API_ERROR_INVALID_INTERFACE: error = clib_error_return(0, "Invalid interface type (must be hardware or sub-interface)"); break;
+      case VNET_API_ERROR_UNSPECIFIED: // Handle the generic error code
+          error = clib_error_return (0, "CBS output feature setup failed (unspecified internal error)");
+          break;
       default:
-          error = clib_error_return (0, "cbs_output_feature_enable_disable failed: %d", rv);
+          error = clib_error_return (0, "cbs_output_feature_enable_disable failed: rv %d", rv);
           break;
       }
 
@@ -653,9 +776,10 @@ set_cbs_command_fn (vlib_main_t * vm, unformat_input_t * input, vlib_cli_command
     cbs_main_t *cbsm = &cbs_main;
     f64 port_rate_bps = 0.0, idleslope_kbps = 0.0, bandwidth_bps_hint = 0.0;
     f64 hicredit_bytes = 0.0, locredit_bytes = 0.0;
-    u32 packet_size = 0;
+    u32 packet_size = 0; // Use 0 to signify default
     int rv;
     clib_error_t * error = 0;
+    // Track mandatory parameters
     int port_rate_set = 0, idleslope_set = 0, hicredit_set = 0, locredit_set = 0;
 
     while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT) {
@@ -663,11 +787,12 @@ set_cbs_command_fn (vlib_main_t * vm, unformat_input_t * input, vlib_cli_command
         else if (unformat (input, "idleslope %U", unformat_cbs_slope, &idleslope_kbps)) idleslope_set = 1;
         else if (unformat (input, "hicredit %f", &hicredit_bytes)) hicredit_set = 1;
         else if (unformat (input, "locredit %f", &locredit_bytes)) locredit_set = 1;
-        else if (unformat (input, "bandwidth %U", unformat_cbs_rate, &bandwidth_bps_hint));
-        else if (unformat (input, "packet-size %u", &packet_size));
+        else if (unformat (input, "bandwidth %U", unformat_cbs_rate, &bandwidth_bps_hint)); // Optional
+        else if (unformat (input, "packet-size %u", &packet_size)); // Optional
         else { error = clib_error_return (0, "unknown input '%U'", format_unformat_error, input); goto done; }
       }
 
+    // Check if all mandatory parameters were provided
     if (!port_rate_set || !idleslope_set || !hicredit_set || !locredit_set) {
         error = clib_error_return (0, "Mandatory parameters missing. Required: port_rate, idleslope, hicredit, locredit");
         goto done;
@@ -676,16 +801,16 @@ set_cbs_command_fn (vlib_main_t * vm, unformat_input_t * input, vlib_cli_command
     rv = cbs_configure_internal (cbsm, port_rate_bps, idleslope_kbps, hicredit_bytes, locredit_bytes, bandwidth_bps_hint, packet_size);
 
     switch (rv) {
-      case 0:
-          vlib_cli_output (vm, "%U", format_cbs_config, 0);
+      case 0: // Success
+          vlib_cli_output (vm, "%U", format_cbs_config, 0 /* verbose=0 */);
           break;
       case VNET_API_ERROR_INVALID_VALUE: error = clib_error_return (0, "Invalid port_rate (must be > 0)"); break;
-      case VNET_API_ERROR_INVALID_VALUE_2: error = clib_error_return (0, "Invalid idleslope (must be > 0)"); break;
+      case VNET_API_ERROR_INVALID_VALUE_2: error = clib_error_return (0, "Invalid idleslope (must be >= 0)"); break;
       case VNET_API_ERROR_INVALID_VALUE_3: error = clib_error_return (0, "Invalid credits (hicredit must be >= locredit)"); break;
       case VNET_API_ERROR_INVALID_VALUE_4: error = clib_error_return (0, "Invalid packet size (must be 64-9000, or 0 for default)"); break;
-      case VNET_API_ERROR_UNSPECIFIED: error = clib_error_return(0, "Configuration failed (e.g., memory allocation error)"); break;
+      case VNET_API_ERROR_UNSPECIFIED: error = clib_error_return(0, "Configuration failed (unspecified internal error)"); break;
       default:
-          error = clib_error_return (0, "cbs_configure_internal failed: %d", rv);
+          error = clib_error_return (0, "cbs_configure_internal failed: rv %d", rv);
           break;
     }
 
@@ -696,21 +821,19 @@ set_cbs_command_fn (vlib_main_t * vm, unformat_input_t * input, vlib_cli_command
 static clib_error_t *
 show_cbs_command_fn (vlib_main_t * vm, unformat_input_t * input, vlib_cli_command_t * cmd)
 {
-    cbs_main_t *cbsm = &cbs_main;
+    // --- MODIFIED --- Removed unused cbsm variable
     int verbose = 0;
     clib_error_t * error = 0;
 
+    // Allow "verbose" argument
     if (unformat (input, "verbose")) verbose = 1;
+    // Check for any other unknown arguments
     else if (unformat_check_input(input) != UNFORMAT_END_OF_INPUT) {
        error = clib_error_return (0, "unknown input '%U'", format_unformat_error, input);
        goto done;
     }
 
-    if (PREDICT_FALSE(cbsm->is_configured == 0)) {
-      error = clib_error_return (0, "CBS not configured. Use 'set cbs ...' first.");
-      goto done;
-    }
-
+    // No need to check is_configured here, format_cbs_config handles it.
     vlib_cli_output (vm, "%U", format_cbs_config, verbose);
 
   done:
