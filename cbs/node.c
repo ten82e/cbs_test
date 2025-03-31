@@ -118,7 +118,8 @@ cbs_buffer_fwd_lookup (cbs_main_t * cbsm, vlib_buffer_t * b,
       // --- ADD DEBUG LOG START ---
       #if VLIB_DEBUG > 0
       u32 vec_len_check = vec_len(cbsm->output_next_index_by_sw_if_index);
-      u32 stored_next_check = (tx_sw_if_index < vec_len_check) ? cbsm->output_next_index_by_sw_if_index[tx_sw_if_index] : (u32)-2; // Read value for logging
+      // Read value for logging only if index is valid
+      u32 stored_next_check = (tx_sw_if_index != (u32)~0 && tx_sw_if_index < vec_len_check) ? cbsm->output_next_index_by_sw_if_index[tx_sw_if_index] : (u32)-2;
       clib_warning("CBS FWD Lookup DBG: Enter Output Mode: bi %u, tx_sw_if %u, vec_len %u, read stored_next %u",
                     bi, tx_sw_if_index, vec_len_check, stored_next_check);
       #endif
@@ -169,6 +170,9 @@ cbs_buffer_fwd_lookup (cbs_main_t * cbsm, vlib_buffer_t * b,
 
 
 /** @brief Processes a single buffer: buffer to wheel or drop. */
+// ============================================================================
+// MODIFIED cbs_dispatch_buffer starts here
+// ============================================================================
 always_inline void
 cbs_dispatch_buffer (vlib_main_t * vm, vlib_node_runtime_t * node,
                      cbs_main_t * cbsm, cbs_wheel_t * wp, vlib_buffer_t * b,
@@ -178,37 +182,36 @@ cbs_dispatch_buffer (vlib_main_t * vm, vlib_node_runtime_t * node,
     if (PREDICT_FALSE(wp->cursize >= wp->wheel_size)) {
         ctx->drop[0] = bi;
         ctx->drop++;
+        // ホイール満杯によるドロップはトレース（nsimも同様の可能性）
         cbs_add_trace(vm, node, b, CBS_TRACE_ACTION_DROP_WHEEL_FULL, CBS_NEXT_DROP);
         return;
     }
 
-    // Determine the next node index *after* the wheel
-    u32 next_idx_after_wheel;
-    cbs_buffer_fwd_lookup(cbsm, b, &next_idx_after_wheel, is_cross_connect);
-
-    // If lookup failed, drop the packet
-    if (PREDICT_FALSE(next_idx_after_wheel == CBS_NEXT_DROP)) {
-         ctx->drop[0] = bi;
-         ctx->drop++;
-         ctx->n_lookup_drop++;
-         cbs_add_trace(vm, node, b, CBS_TRACE_ACTION_DROP_LOOKUP_FAIL, CBS_NEXT_DROP);
-         return;
-    }
-
-    // Add the buffer to the wheel
+    // --- MODIFICATION START ---
+    // 先にホイールにエントリを追加する
     cbs_wheel_entry_t *e = &wp->entries[wp->tail];
-    e->buffer_index = bi;
-    e->rx_sw_if_index = vnet_buffer(b)->sw_if_index[VLIB_RX]; // Store original RX
-    e->tx_sw_if_index = vnet_buffer(b)->sw_if_index[VLIB_TX]; // Store potentially modified TX (for cross-connect)
-    e->output_next_index = next_idx_after_wheel;             // Store the calculated next index
-
     wp->tail = (wp->tail + 1) % wp->wheel_size;
     wp->cursize++;
     ctx->n_buffered++;
 
-    // Add trace for successful buffering
-    cbs_add_trace(vm, node, b, CBS_TRACE_ACTION_BUFFER, next_idx_after_wheel);
+    // ルックアップを実行し、結果を直接エントリに保存する
+    // ルックアップが失敗した場合 (CBS_NEXT_DROP or ~0) でも、
+    // その値が保存され、後のデキュー時にドロップされることになる
+    cbs_buffer_fwd_lookup(cbsm, b, &e->output_next_index, is_cross_connect); // Lookup and store
+
+    e->buffer_index = bi;
+    e->rx_sw_if_index = vnet_buffer(b)->sw_if_index[VLIB_RX]; // Store original RX
+    e->tx_sw_if_index = vnet_buffer(b)->sw_if_index[VLIB_TX]; // Store potentially modified TX
+    // e->output_next_index は cbs_buffer_fwd_lookup で設定済み
+
+    // バッファリング成功のトレースを追加 (ルックアップ結果も含む)
+    cbs_add_trace(vm, node, b, CBS_TRACE_ACTION_BUFFER, e->output_next_index);
+    // Removed the specific trace/drop for lookup failure at enqueue time.
+    // --- MODIFICATION END ---
 }
+// ============================================================================
+// MODIFIED cbs_dispatch_buffer ends here
+// ============================================================================
 
 
 /* --- Main Node Function --- */
@@ -230,51 +233,34 @@ cbs_inline_fn (vlib_main_t * vm, vlib_node_runtime_t * node, vlib_frame_t * fram
     b = bufs;
 
     // --- Fallback Logic: If CBS not configured or no wheel for this thread ---
-    // Directly enqueue to the next node in the graph without CBS processing.
-    // This relies on the feature arc setup: if this feature node is enabled,
-    // the next node should be the one originally intended after this feature.
     if (PREDICT_FALSE(!cbsm->is_configured || thread_index >= vec_len(cbsm->wheel_by_thread) || !(wp = cbsm->wheel_by_thread[thread_index]))) {
+        // ... (フォールバック処理は変更なし) ...
+         u16 *next_indices = vlib_node_get_runtime_data (vm, node->node_index);
+         if (PREDICT_FALSE(!next_indices)) {
+             vlib_buffer_free (vm, from, frame->n_vectors);
+             // Note: Using CBS_ERROR_DROPPED_LOOKUP_FAIL here might be slightly inaccurate now,
+             // as it could be NO_WHEEL or NOT_CONFIGURED, but it indicates a failure to forward.
+             vlib_node_increment_counter(vm, node->node_index, CBS_ERROR_DROPPED_LOOKUP_FAIL, frame->n_vectors);
+             return frame->n_vectors;
+         }
+        vlib_buffer_enqueue_to_next(vm, node, from, next_indices, frame->n_vectors);
         vlib_node_increment_counter (vm, node->node_index,
                                      cbsm->is_configured ? CBS_ERROR_NO_WHEEL : CBS_ERROR_NOT_CONFIGURED,
                                      frame->n_vectors);
-
-        // Get the next node index configured for this feature node (runtime data)
-        // This assumes the default next node (index 0) is the correct pass-through path.
-        // NOTE: This passthrough logic might need refinement depending on graph setup.
-        // If the feature is *disabled*, this node shouldn't run. If enabled but *misconfigured*,
-        // forwarding to the default next node (usually error-drop) might be safer than guessing.
-        // For now, assuming the runtime data holds the passthrough next index.
-        // A safer alternative is to force drop here if misconfigured.
-        u16 *next_indices = vlib_node_get_runtime_data (vm, node->node_index); // This gets the next_nodes array
-        if (PREDICT_FALSE(!next_indices)) {
-            // Catastrophic failure, drop everything
-             vlib_buffer_free (vm, from, frame->n_vectors);
-             vlib_node_increment_counter(vm, node->node_index, CBS_ERROR_DROPPED_LOOKUP_FAIL, frame->n_vectors);
-             return frame->n_vectors;
-        }
-         // Enqueue to the *first* next node defined for this graph node (often index 0)
-         // This might not be the desired passthrough behavior in all cases.
-        vlib_buffer_enqueue_to_next(vm, node, from, next_indices, frame->n_vectors);
-
-        return frame->n_vectors; // All packets forwarded (or dropped if next_indices[0] is drop)
+        return frame->n_vectors;
     }
 
     // --- Normal Processing Logic: Buffer packets to the CBS wheel ---
     ctx.drop = drops;          // Point to the start of the drop array
     ctx.n_buffered = 0;      // Reset counters for this frame
-    ctx.n_lookup_drop = 0;
+    // ctx.n_lookup_drop = 0; // <<<--- Removed counter initialization, no longer needed here
 
     // --- Process Packets in Batches ---
-    // Loop unrolling for efficiency (common VPP pattern)
+    // ... (ループ処理は変更なし、内部で修正された cbs_dispatch_buffer が呼ばれる) ...
     while (n_left_from >= 8) {
-       // Prefetch buffer headers for the next iteration
-       vlib_prefetch_buffer_header(b[4], STORE); vlib_prefetch_buffer_header(b[5], STORE);
-       vlib_prefetch_buffer_header(b[6], STORE); vlib_prefetch_buffer_header(b[7], STORE);
-       // Prefetch buffer data (optional, might help depending on access patterns)
-       // clib_prefetch_load (&b[4]->pre_data); clib_prefetch_load (&b[5]->pre_data);
-       // clib_prefetch_load (&b[6]->pre_data); clib_prefetch_load (&b[7]->pre_data);
+        vlib_prefetch_buffer_header(b[4], STORE); vlib_prefetch_buffer_header(b[5], STORE);
+        vlib_prefetch_buffer_header(b[6], STORE); vlib_prefetch_buffer_header(b[7], STORE);
 
-        // Process 8 packets
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[0], from[0], &ctx, is_cross_connect);
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[1], from[1], &ctx, is_cross_connect);
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[2], from[2], &ctx, is_cross_connect);
@@ -287,14 +273,9 @@ cbs_inline_fn (vlib_main_t * vm, vlib_node_runtime_t * node, vlib_frame_t * fram
         b += 8; from += 8; n_left_from -= 8;
     }
      while (n_left_from >= 4) {
-        // Prefetch headers
         vlib_prefetch_buffer_header(b[0], STORE); vlib_prefetch_buffer_header(b[1], STORE);
         vlib_prefetch_buffer_header(b[2], STORE); vlib_prefetch_buffer_header(b[3], STORE);
-        // Prefetch data
-        // clib_prefetch_load (&b[0]->pre_data); clib_prefetch_load (&b[1]->pre_data);
-        // clib_prefetch_load (&b[2]->pre_data); clib_prefetch_load (&b[3]->pre_data);
 
-        // Process 4 packets
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[0], from[0], &ctx, is_cross_connect);
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[1], from[1], &ctx, is_cross_connect);
         cbs_dispatch_buffer (vm, node, cbsm, wp, b[2], from[2], &ctx, is_cross_connect);
@@ -313,20 +294,26 @@ cbs_inline_fn (vlib_main_t * vm, vlib_node_runtime_t * node, vlib_frame_t * fram
     if (PREDICT_FALSE(n_dropped_total > 0)) {
         vlib_buffer_free (vm, drops, n_dropped_total); // Free the dropped buffers
 
+        // --- MODIFICATION START ---
         // Increment drop counters
-        u32 n_wheel_full_drops = n_dropped_total - ctx.n_lookup_drop;
+        // u32 n_wheel_full_drops = n_dropped_total - ctx.n_lookup_drop; // Original
+        // Now all drops counted here are due to wheel full, as lookup failures are not tracked separately here.
+        u32 n_wheel_full_drops = n_dropped_total;
         if (n_wheel_full_drops > 0) {
              vlib_node_increment_counter (vm, node->node_index, CBS_ERROR_DROPPED_WHEEL_FULL, n_wheel_full_drops);
         }
-        if (ctx.n_lookup_drop > 0) {
-             vlib_node_increment_counter (vm, node->node_index, CBS_ERROR_DROPPED_LOOKUP_FAIL, ctx.n_lookup_drop);
-        }
+        // Removed the specific counter increment for DROPPED_LOOKUP_FAIL
+        // if (ctx.n_lookup_drop > 0) {
+        //      vlib_node_increment_counter (vm, node->node_index, CBS_ERROR_DROPPED_LOOKUP_FAIL, ctx.n_lookup_drop);
+        // }
          #if VLIB_DEBUG > 0
          if (n_dropped_total > 0) {
-             clib_warning("CBS Enqueue node %s: Dropped %u packets (WheelFull: %u, LookupFail: %u)",
-                          node->name, n_dropped_total, n_wheel_full_drops, ctx.n_lookup_drop);
+             // Adjusted log message
+             clib_warning("CBS Enqueue node %s: Dropped %u packets (WheelFull: %u)",
+                          node->name, n_dropped_total, n_wheel_full_drops);
          }
          #endif
+         // --- MODIFICATION END ---
     }
 
    // Increment buffered packet counter
@@ -377,7 +364,8 @@ format_cbs_trace (u8 * s, va_list * args)
   switch(t->trace_action) {
       case CBS_TRACE_ACTION_BUFFER: action_str = "BUFFER"; break;
       case CBS_TRACE_ACTION_DROP_WHEEL_FULL: action_str = "DROP_WHEEL_FULL"; break;
-      case CBS_TRACE_ACTION_DROP_LOOKUP_FAIL: action_str = "DROP_LOOKUP_FAIL"; break;
+      // CBS_TRACE_ACTION_DROP_LOOKUP_FAIL is no longer generated here, but keep case for completeness? Or remove? Let's remove for now.
+      // case CBS_TRACE_ACTION_DROP_LOOKUP_FAIL: action_str = "DROP_LOOKUP_FAIL"; break;
       default: break;
   }
 
