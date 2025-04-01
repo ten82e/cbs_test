@@ -9,12 +9,13 @@
 
 #include <vlib/vlib.h>
 #include <vnet/vnet.h>
-#include <vppinfra/error.h>
+#include <vppinfra/error.h> // Needed for clib_warning
 #include <vppinfra/time.h>
 #include <vppinfra/format.h>
 #include <vppinfra/macros.h>
 #include <cbs/cbs.h>
 #include <vnet/ethernet/ethernet.h>
+// #include <vlib/log.h> // Keep if other parts still use vlib_log, remove if not
 
 /* --- Error Code Definitions --- */
 #define foreach_cbs_tx_error                    \
@@ -47,30 +48,18 @@ typedef struct
 
 
 /* --- Static Function Declarations/Definitions --- */
+
+// --- MODIFIED: Add forward declaration ---
 static void
 cbs_input_add_trace (vlib_main_t * vm, vlib_node_runtime_t * node,
                    u32 bi, f64 tx_time, u32 next_index,
-                   f64 credits_before, f64 credits_after, u32 len)
-{
-  // ... (Implementation as before) ...
-   vlib_buffer_t *b = vlib_get_buffer (vm, bi);
-   if (PREDICT_FALSE(node->flags & VLIB_NODE_FLAG_TRACE) && PREDICT_FALSE(b && (b->flags & VLIB_BUFFER_IS_TRACED)))
-     {
-       cbs_tx_trace_t *t = vlib_add_trace (vm, node, b, sizeof (*t));
-       t->buffer_index = bi;
-       t->tx_time = tx_time;
-       t->next_index = next_index;
-       t->cbs_credits_before = credits_before;
-       t->cbs_credits_after = credits_after;
-       t->packet_len = len;
-     }
-}
+                   f64 credits_before, f64 credits_after, u32 len);
+// --- END MODIFIED ---
 
 static_always_inline uword
 cbs_input_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
                   vlib_frame_t * frame)
 {
-  // ... (Implementation as before) ...
    cbs_main_t *cbsm = &cbs_main;
    u32 thread_index = vm->thread_index;
    cbs_wheel_t *wp = NULL;
@@ -83,6 +72,7 @@ cbs_input_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
 
    if (PREDICT_FALSE (thread_index >= vec_len(cbsm->wheel_by_thread) || !(wp = cbsm->wheel_by_thread[thread_index]))) {
        vlib_node_increment_counter (vm, node->node_index, CBS_TX_ERROR_NO_WHEEL_FOR_THREAD, 1);
+       // clib_warning("T%u: No wheel found!", thread_index);
        return 0;
    }
 
@@ -98,45 +88,41 @@ cbs_input_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
        wp->cbs_credits += gained_credits;
        wp->cbs_credits = clib_min(wp->cbs_credits, cbsm->cbs_hicredit);
        wp->cbs_last_update_time = now;
-        #if VLIB_DEBUG > 0
-        // clib_warning(...)
-        #endif
    }
 
    while (n_tx_packets < CBS_MAX_TX_BURST && wp->cursize > 0) {
-       // ... (prefetching logic) ...
 
        f64 tx_allowed_time = wp->cbs_last_tx_finish_time;
 
+       clib_warning("CBS_DBG T%u: Stall Check: now %.9f, allowed %.9f, credits %.2f, cursize %u",
+                    thread_index, now, tx_allowed_time, wp->cbs_credits, wp->cursize);
+
         if (now < tx_allowed_time) {
-            #if VLIB_DEBUG > 0
-            // clib_warning(...)
-            #endif
+            clib_warning("CBS_DBG T%u: STALLED (port busy: now %.9f < allowed %.9f)",
+                          thread_index, now, tx_allowed_time);
             vlib_node_increment_counter (vm, node->node_index, CBS_TX_ERROR_STALLED_PORT_BUSY, 1);
             break;
          }
 
-       cbs_wheel_entry_t *ep = wp->entries + wp->head;
-       u32 bi = ep->buffer_index;
+        cbs_wheel_entry_t *ep = wp->entries + wp->head;
+        u32 bi = ep->buffer_index;
 
-       if (PREDICT_FALSE(bi == ~0)) { wp->head = (wp->head + 1) % wp->wheel_size; wp->cursize--; continue; }
-       vlib_buffer_t *b = vlib_get_buffer(vm, bi);
-       if (PREDICT_FALSE(!b)) {
-           #if VLIB_DEBUG > 0
-           // clib_warning(...)
-           #endif
-           vlib_node_increment_counter (vm, node->node_index, CBS_TX_ERROR_INVALID_BUFFER, 1);
-           ep->buffer_index = ~0;
-           wp->head = (wp->head + 1) % wp->wheel_size;
-           wp->cursize--;
-           continue;
-       }
-       u32 len = vlib_buffer_length_in_chain(vm, b);
+        if (PREDICT_FALSE(bi == ~0)) { wp->head = (wp->head + 1) % wp->wheel_size; wp->cursize--; continue; }
+        vlib_buffer_t *b = vlib_get_buffer(vm, bi);
+        if (PREDICT_FALSE(!b)) {
+            clib_warning("T%u: Invalid buffer index %u found in wheel", thread_index, bi);
+            vlib_node_increment_counter (vm, node->node_index, CBS_TX_ERROR_INVALID_BUFFER, 1);
+            ep->buffer_index = ~0;
+            wp->head = (wp->head + 1) % wp->wheel_size;
+            wp->cursize--;
+            continue;
+        }
+        u32 len = vlib_buffer_length_in_chain(vm, b);
+
 
        if (wp->cbs_credits < 0 && cbsm->cbs_sendslope < 0) {
-            #if VLIB_DEBUG > 0
-            // clib_warning(...)
-            #endif
+            clib_warning("CBS_DBG T%u: STALLED (credits %.4f < 0 && sendslope %.4f < 0)",
+                          thread_index, wp->cbs_credits, cbsm->cbs_sendslope);
             vlib_node_increment_counter (vm, node->node_index, CBS_TX_ERROR_STALLED_CREDITS, 1);
             break;
          }
@@ -151,11 +137,9 @@ cbs_input_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
        f64 credit_change = tx_duration * cbsm->cbs_sendslope;
        wp->cbs_credits += credit_change;
        wp->cbs_last_tx_finish_time = now + tx_duration;
-       wp->cbs_last_update_time = now;
 
-       #if VLIB_DEBUG > 0
-       // clib_warning(...)
-       #endif
+       clib_warning("CBS_DBG T%u: Dequeued Pkt: len %u, tx_dur %.9f, cred_chg %.4f -> credits %.4f, next_finish %.9f",
+                    thread_index, len, tx_duration, credit_change, wp->cbs_credits, wp->cbs_last_tx_finish_time);
 
        cbs_input_add_trace(vm, node, bi, now, next_node_index_for_buffer, credits_before, wp->cbs_credits, len);
 
@@ -166,9 +150,7 @@ cbs_input_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
      }
 
    if (n_tx_packets > 0) {
-       #if VLIB_DEBUG > 0
-       // clib_warning(...)
-       #endif
+       // clib_warning("CBS_DBG T%u: Enqueuing %u packets to next node", thread_index, n_tx_packets);
        vlib_buffer_enqueue_to_next(vm, node, to_next_bufs, to_next_nodes, n_tx_packets);
        vlib_node_increment_counter(vm, node->node_index, CBS_TX_ERROR_TRANSMITTED, n_tx_packets);
      }
@@ -179,27 +161,41 @@ cbs_input_inline (vlib_main_t * vm, vlib_node_runtime_t * node,
    return n_tx_packets;
 }
 
-/* --- Node Function Definition --- */
-// No need for a separate _fn declaration here, VLIB_NODE_FN handles it.
-// static uword cbs_input_node_fn (vlib_main_t * vm, vlib_node_runtime_t * node, vlib_frame_t * frame); // REMOVED
+// --- Definition of cbs_input_add_trace ---
+static void
+cbs_input_add_trace (vlib_main_t * vm, vlib_node_runtime_t * node,
+                   u32 bi, f64 tx_time, u32 next_index,
+                   f64 credits_before, f64 credits_after, u32 len)
+{
+   vlib_buffer_t *b = vlib_get_buffer (vm, bi);
+   if (PREDICT_FALSE(node->flags & VLIB_NODE_FLAG_TRACE) && PREDICT_FALSE(b && (b->flags & VLIB_BUFFER_IS_TRACED)))
+     {
+       cbs_tx_trace_t *t = vlib_add_trace (vm, node, b, sizeof (*t));
+       t->buffer_index = bi;
+       t->tx_time = tx_time;
+       t->next_index = next_index;
+       t->cbs_credits_before = credits_before;
+       t->cbs_credits_after = credits_after;
+       t->packet_len = len;
+     }
+}
+
+
+/* ... (Node Function, Registration etc. は変更なし) ... */
 
 VLIB_NODE_FN (cbs_input_node) (vlib_main_t * vm, vlib_node_runtime_t * node, vlib_frame_t * frame)
 {
     return cbs_input_inline (vm, node, frame);
 }
 
-
-/* --- Node Registration and Trace Formatting (Base Implementation Only) --- */
 #ifndef CLIB_MARCH_VARIANT
 
-// --- Error Strings ---
 static char *cbs_tx_error_strings[] = {
 #define _(sym,string) string,
   foreach_cbs_tx_error
 #undef _
 };
 
-// --- Trace Formatting Function ---
 static u8 *
 format_cbs_tx_trace (u8 * s, va_list * args)
 {
@@ -213,7 +209,6 @@ format_cbs_tx_trace (u8 * s, va_list * args)
   return s;
 }
 
-// --- Node Registration ---
 vlib_node_registration_t cbs_input_node;
 
 VLIB_REGISTER_NODE (cbs_input_node) =
@@ -221,8 +216,6 @@ VLIB_REGISTER_NODE (cbs_input_node) =
   .type = VLIB_NODE_TYPE_INPUT,
   .name = "cbs-wheel",
   .state = VLIB_NODE_STATE_DISABLED,
-  // Let VPP resolve the function pointer based on naming convention
-  // .function = cbs_input_node_fn, // REMOVED this line
   .format_trace = format_cbs_tx_trace,
   .n_errors = CBS_TX_N_ERROR,
   .error_strings = cbs_tx_error_strings,
@@ -231,9 +224,4 @@ VLIB_REGISTER_NODE (cbs_input_node) =
 
 #endif // CLIB_MARCH_VARIANT
 
-/*
- * fd.io coding-style-patch-verification: ON
- * Local Variables:
- * eval: (c-set-style "gnu")
- * End:
- */
+/* ... */

@@ -18,9 +18,10 @@
 #include <vppinfra/error.h>
 #include <vppinfra/time.h>
 #include <vppinfra/clib.h> // For cache line alignment macro
+#include <vlib/log.h>      // Include for vlib_log_class_t
 
 // Constants
-#define CBS_MAX_TX_BURST 32         /**< Max packets to dequeue in one go from wheel */
+#define CBS_MAX_TX_BURST 8         /**< Max packets to dequeue in one go from wheel (Reduced from 32) */
 #define CBS_DEFAULT_PACKET_SIZE 1500 /**< Default average packet size if not specified */
 #define CBS_BITS_PER_BYTE 8.0
 #define CBS_KBPS_TO_BPS 1000.0
@@ -67,7 +68,7 @@ typedef struct cbs_node_ctx
 {
   u32 *drop;          /**< Pointer to array for dropped buffer indices */
   u32 n_buffered;     /**< Number of packets buffered to the wheel in this frame */
-  u32 n_lookup_drop;  /**< Number of packets dropped due to lookup failure */
+  // u32 n_lookup_drop;  /**< Number of packets dropped due to lookup failure (removed) */
 } cbs_node_ctx_t;
 
 
@@ -78,6 +79,7 @@ typedef struct
   u16 msg_id_base;    /**< API message ID base */
   vlib_main_t *vlib_main; /**< VLIB main pointer */
   vnet_main_t *vnet_main; /**< VNET main pointer */
+  vlib_log_class_t log_class; /**< Log class for this plugin */
 
   /* Feature arcs */
   u16 arc_index;      /**< Index for the "interface-output" feature arc */
